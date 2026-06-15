@@ -1,0 +1,10 @@
+# Ignore environment files with secrets
+.env
+deepagentsdemo/.env
+
+# Byte-compiled / cached files
+__pycache__/
+.pytest_cache/
+
+# Virtual environment
+.venv/
