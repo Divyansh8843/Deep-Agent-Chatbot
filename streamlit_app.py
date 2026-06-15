@@ -36,6 +36,8 @@ load_dotenv(ROOT_DIR / ".env")
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend, StateBackend, StoreBackend
 from deepagents.backends.utils import create_file_data
+from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 from tavily import TavilyClient
@@ -43,7 +45,49 @@ from tavily import TavilyClient
 # ---------------------------------------------------------------------------
 # Custom tool (notebook 1: Tavily internet search)
 # ---------------------------------------------------------------------------
-tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+def get_secret(name: str) -> str | None:
+    """Read configuration from local environment or Streamlit Cloud secrets."""
+    if value := os.getenv(name):
+        return value
+    try:
+        return st.secrets.get(name)
+    except (FileNotFoundError, KeyError):
+        return None
+
+
+def resolve_chat_model(model_name: str):
+    """Build provider clients explicitly instead of using optional imports."""
+    if model_name.startswith("openrouter:"):
+        api_key = get_secret("OPENROUTER_API_KEY") or get_secret("ROUTER_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "Add OPENROUTER_API_KEY to Streamlit Cloud app secrets."
+            )
+        return ChatOpenAI(
+            model=model_name.removeprefix("openrouter:"),
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+    if model_name.startswith("groq:"):
+        api_key = get_secret("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError("Add GROQ_API_KEY to Streamlit Cloud app secrets.")
+        return ChatGroq(
+            model=model_name.removeprefix("groq:"),
+            api_key=api_key,
+        )
+
+    if model_name.startswith("openai:"):
+        api_key = get_secret("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("Add OPENAI_API_KEY to Streamlit Cloud app secrets.")
+        return ChatOpenAI(
+            model=model_name.removeprefix("openai:"),
+            api_key=api_key,
+        )
+
+    raise ValueError(f"Unsupported model provider in {model_name!r}.")
 
 
 def internet_search(
@@ -53,7 +97,10 @@ def internet_search(
     include_raw_content: bool = False,
 ):
     """Run a web search"""
-    return tavily_client.search(
+    api_key = get_secret("TAVILY_API_KEY")
+    if not api_key:
+        raise RuntimeError("Add TAVILY_API_KEY to enable internet search.")
+    return TavilyClient(api_key=api_key).search(
         query,
         max_results=max_results,
         include_raw_content=include_raw_content,
@@ -165,7 +212,7 @@ def build_agent(cfg: dict):
 
     # --- assemble the deep agent --------------------------------------------
     kwargs = dict(
-        model=cfg["model"],
+        model=resolve_chat_model(cfg["model"]),
         tools=[internet_search],
         system_prompt=cfg["system_prompt"],
         backend=backend,
@@ -344,15 +391,15 @@ with st.sidebar:
         st.rerun()
 
     # missing-key warnings
-    if model.startswith("groq") and not os.getenv("GROQ_API_KEY"):
+    if model.startswith("groq") and not get_secret("GROQ_API_KEY"):
         st.error("GROQ_API_KEY missing from .env")
-    if model.startswith("openai") and not os.getenv("OPENAI_API_KEY"):
+    if model.startswith("openai") and not get_secret("OPENAI_API_KEY"):
         st.error("OPENAI_API_KEY missing from .env")
-    if not os.getenv("TAVILY_API_KEY"):
+    if not get_secret("TAVILY_API_KEY"):
         st.warning("TAVILY_API_KEY missing — web search will fail")
     # Router / gateway API key check (openrouter / generic router)
     if model.startswith("openrouter") and not (
-        os.getenv("OPENROUTER_API_KEY") or os.getenv("ROUTER_API_KEY")
+        get_secret("OPENROUTER_API_KEY") or get_secret("ROUTER_API_KEY")
     ):
         st.error("OPENROUTER_API_KEY or ROUTER_API_KEY missing from .env")
 
@@ -368,7 +415,16 @@ cfg = {
 # Rebuild the agent only when the configuration changes
 cfg_key = str(sorted(cfg.items()))
 if st.session_state.get("cfg_key") != cfg_key:
-    st.session_state.agent, st.session_state.seed_files = build_agent(cfg)
+    try:
+        st.session_state.agent, st.session_state.seed_files = build_agent(cfg)
+    except Exception as exc:
+        st.error("The agent could not be initialized.")
+        st.code(str(exc))
+        st.info(
+            "On Streamlit Cloud, add API keys under Manage app > Settings > "
+            "Secrets, then reboot the app."
+        )
+        st.stop()
     st.session_state.cfg_key = cfg_key
 
 # --- replay chat history -----------------------------------------------------
